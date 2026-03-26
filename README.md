@@ -7,7 +7,7 @@ Stealth browser MCP server with 58 tools for anti-detect web automation. Drop-in
 ## Quick Start
 
 ```bash
-uvx camoufox-mcp-server
+uvx --from camoufox-mcp-server camoufox-mcp
 ```
 
 Or install from source:
@@ -29,7 +29,7 @@ Add to your `.mcp.json`:
     "camoufox": {
       "type": "stdio",
       "command": "uvx",
-      "args": ["camoufox-mcp-server"],
+      "args": ["--from", "camoufox-mcp-server", "camoufox-mcp"],
       "env": {
         "CAMOUFOX_HEADLESS": "true",
         "CAMOUFOX_HUMANIZE": "true"
