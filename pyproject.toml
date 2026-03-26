@@ -1,5 +1,5 @@
 [project]
-name = "camoufox-mcp"
+name = "camoufox-mcp-server"
 version = "0.1.0"
 description = "Stealth browser MCP server using Camoufox (anti-detect Firefox)"
 requires-python = ">=3.10"
