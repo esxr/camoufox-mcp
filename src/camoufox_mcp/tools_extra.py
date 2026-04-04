@@ -1,5 +1,6 @@
 """DevTools, PDF, and testing/verification tools."""
 
+import os
 import shutil
 import tempfile
 
@@ -44,39 +45,55 @@ async def browser_stop_tracing() -> str:
 
 @mcp.tool()
 async def browser_start_video(width: int | None = None, height: int | None = None) -> str:
-    """Check video recording status. Video must be configured at browser launch time."""
+    """Start video recording using screenshot capture + ffmpeg encoding.
+
+    This captures periodic screenshots and encodes them to .mp4 on stop.
+    If not already recording, starts the capture loop (no browser restart needed).
+
+    - width: optional video width (currently ignored; uses viewport size)
+    - height: optional video height (currently ignored; uses viewport size)
+    """
     try:
         await manager.ensure_browser()
-        page = manager.page
-        if page.video:
-            try:
-                path = await page.video.path()
-                return f"Video is being recorded at: {path}"
-            except Exception:
-                return "Video recording requires browser restart with video config. Set CAMOUFOX_VIDEO=true env var."
-        return "Video recording requires browser restart with video config. Set CAMOUFOX_VIDEO=true env var."
+        # Already recording?
+        if manager._recording:
+            path = manager.recording_video_path
+            return f"Already recording video. Output will be: {path}"
+
+        # Start recording
+        if width and height:
+            manager.record_video_size = {"width": width, "height": height}
+        manager.record_video = True
+        await manager._start_recording()
+        path = manager.recording_video_path
+        return f"Video recording started. Output will be: {path}"
     except Exception as e:
-        return f"Error checking video status: {e}"
+        return f"Error starting video recording: {e}"
 
 
 @mcp.tool()
 async def browser_stop_video(filename: str | None = None) -> str:
-    """Stop video recording and optionally copy to a specific filename."""
+    """Stop video recording. Encodes captured frames to .mp4 using ffmpeg.
+
+    - filename: optional path to copy the final video file to
+    """
     try:
-        await manager.ensure_browser()
-        page = manager.page
-        if not page.video:
-            return "No video recording is active. Video must be configured at browser launch with CAMOUFOX_VIDEO=true."
-        try:
-            path = await page.video.path()
-            if filename:
-                shutil.copy2(str(path), filename)
-                return f"Video saved to: {filename}"
-            return f"Video available at: {path}"
-        except Exception as e:
-            return f"Error accessing video: {e}"
+        if not manager._recording:
+            return "Video recording is not active."
+
+        video_path = await manager._stop_recording()
+        manager.record_video = False
+
+        if not video_path:
+            return "Video recording stopped. No video file was produced (no frames captured)."
+
+        if filename:
+            shutil.copy2(video_path, filename)
+            return f"Video saved to: {filename}\nOriginal: {video_path}"
+
+        return f"Video recording stopped. Saved to: {video_path}"
     except Exception as e:
-        return f"Error stopping video: {e}"
+        return f"Error stopping video recording: {e}"
 
 
 # ---------------------------------------------------------------------------

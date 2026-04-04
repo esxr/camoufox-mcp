@@ -2,8 +2,14 @@
 
 import asyncio
 import base64
+import glob
 import json
 import os
+import shutil
+import subprocess
+import tempfile
+import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -79,6 +85,15 @@ class BrowserManager:
         self._file_chooser: Optional[FileChooser] = None
         self._routes: List[RouteInfo] = []
         self._tracing = False
+        self.record_video = False
+        self.record_video_size = None  # {"width": int, "height": int} or None
+        self.output_dir = "./.recordings"
+        # Screenshot-based video recording state
+        self._recording = False
+        self._recording_task: Optional[asyncio.Task] = None
+        self._recording_frames_dir: Optional[str] = None
+        self._recording_video_path: Optional[str] = None
+        self._recording_fps = 5  # frames per second for screenshot capture
 
     @staticmethod
     def _parse_proxy(proxy_str: str) -> dict:
@@ -121,15 +136,23 @@ class BrowserManager:
 
         # AsyncNewBrowser returns a Browser instance
         self._browser = await AsyncNewBrowser(self._playwright, **kwargs)
-        self._context = await self._browser.new_context(
-            viewport={"width": self.viewport_width, "height": self.viewport_height}
-        )
+        # Build context kwargs — NOTE: record_video_dir is Chromium-only,
+        # so we use screenshot-based recording via _start_recording() instead.
+        context_kwargs = {
+            "viewport": {"width": self.viewport_width, "height": self.viewport_height}
+        }
+
+        self._context = await self._browser.new_context(**context_kwargs)
 
         page = await self._context.new_page()
 
         tab = TabInfo(page=page)
         self._setup_page_listeners(tab)
         self._tabs.append(tab)
+
+        # Start screenshot-based video recording if enabled
+        if self.record_video:
+            await self._start_recording()
 
     def _setup_page_listeners(self, tab: TabInfo) -> None:
         page = tab.page
@@ -329,11 +352,120 @@ class BrowserManager:
 
         return locator
 
+    # ── Screenshot-based video recording ─────────────────────────
+
+    async def _start_recording(self) -> None:
+        """Start a background task that periodically captures screenshots."""
+        if self._recording:
+            return
+        # Create frames directory inside output_dir/videos/
+        video_dir = os.path.join(self.output_dir, "videos")
+        os.makedirs(video_dir, exist_ok=True)
+        self._recording_frames_dir = tempfile.mkdtemp(prefix="frames_", dir=video_dir)
+        video_name = f"video_{uuid.uuid4().hex[:8]}.mp4"
+        self._recording_video_path = os.path.join(video_dir, video_name)
+        self._recording = True
+        self._recording_task = asyncio.create_task(self._capture_loop())
+
+    async def _capture_loop(self) -> None:
+        """Background loop: take a screenshot every 1/fps seconds."""
+        frame_num = 0
+        interval = 1.0 / self._recording_fps
+        while self._recording:
+            page = self.page
+            if page:
+                try:
+                    frame_path = os.path.join(
+                        self._recording_frames_dir, f"frame_{frame_num:06d}.png"
+                    )
+                    await page.screenshot(path=frame_path, type="png")
+                    frame_num += 1
+                except Exception:
+                    pass  # page may be navigating / closed
+            await asyncio.sleep(interval)
+
+    async def _stop_recording(self) -> Optional[str]:
+        """Stop the capture loop and encode frames to .webm with ffmpeg."""
+        if not self._recording:
+            return None
+        self._recording = False
+        if self._recording_task:
+            try:
+                self._recording_task.cancel()
+                try:
+                    await self._recording_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            except Exception:
+                pass
+            self._recording_task = None
+
+        video_path = self._recording_video_path
+        frames_dir = self._recording_frames_dir
+
+        if not frames_dir or not os.path.isdir(frames_dir):
+            return None
+
+        # Check we have frames
+        frame_files = sorted(glob.glob(os.path.join(frames_dir, "frame_*.png")))
+        if not frame_files:
+            shutil.rmtree(frames_dir, ignore_errors=True)
+            return None
+
+        # Encode with ffmpeg: input pattern -> webm (VP8)
+        try:
+            cmd = [
+                "ffmpeg", "-y",
+                "-framerate", str(self._recording_fps),
+                "-i", os.path.join(frames_dir, "frame_%06d.png"),
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                video_path,
+            ]
+            proc = subprocess.run(
+                cmd, capture_output=True, timeout=60
+            )
+            # Clean up frames
+            shutil.rmtree(frames_dir, ignore_errors=True)
+            self._recording_frames_dir = None
+
+            if proc.returncode == 0 and os.path.isfile(video_path):
+                return video_path
+            else:
+                return None
+        except Exception:
+            shutil.rmtree(frames_dir, ignore_errors=True)
+            self._recording_frames_dir = None
+            return None
+
+    @property
+    def recording_video_path(self) -> Optional[str]:
+        """Return the path where the current recording will be saved."""
+        return self._recording_video_path
+
+    async def restart_with_recording(self, enable: bool, video_size: dict | None = None) -> None:
+        """Restart browser context with or without video recording."""
+        current_url = self.page.url if self.page else None
+        await self.close()
+        self.record_video = enable
+        if video_size:
+            self.record_video_size = video_size
+        await self.ensure_browser()
+        if current_url and current_url not in ("about:blank", ""):
+            try:
+                await self.page.goto(current_url, wait_until="domcontentloaded")
+            except Exception:
+                pass
+
     # ── Cleanup ─────────────────────────────────────────────────────
 
     async def close(self) -> None:
         """Close browser and clean up."""
         self._tracing = False
+        # Stop screenshot-based video recording (encodes to .webm)
+        await self._stop_recording()
         if self._context:
             try:
                 await self._context.close()

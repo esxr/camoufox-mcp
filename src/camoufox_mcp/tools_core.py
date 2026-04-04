@@ -337,12 +337,23 @@ async def browser_evaluate(
 
 @mcp.tool()
 async def browser_run_code(code: str) -> str:
-    """Execute JavaScript code in the browser."""
+    """Execute async Playwright Python code with `page` and `context` in scope.
+
+    Example: 'await page.frame_locator(\"iframe\").first.locator(\"#btn\").click()'
+    """
     await manager.ensure_browser()
     page = manager.page
+    context = manager.context
     try:
-        result = await page.evaluate(code)
-        return json.dumps(result, default=str, ensure_ascii=False)
+        local_vars: dict = {"page": page, "context": context, "result": None}
+        wrapped = "async def __run__():\n"
+        for line in code.splitlines():
+            wrapped += f"    {line}\n"
+        exec(compile(wrapped, "<run_code>", "exec"), local_vars)
+        result = await local_vars["__run__"]()
+        if result is not None:
+            return json.dumps(result, default=str, ensure_ascii=False)
+        return "Code executed successfully."
     except Exception as e:
         return f"Run code error: {e}"
 
