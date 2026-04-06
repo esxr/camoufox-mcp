@@ -107,6 +107,43 @@ class BrowserManager:
             result["password"] = p.password
         return result
 
+    @staticmethod
+    def _strip_viewport_from_launch_opts(opts: Dict[str, Any]) -> None:
+        """Remove viewport-locking keys from Camoufox config env vars.
+
+        Camoufox injects fixed window.innerWidth/innerHeight values via its
+        fingerprint system, which locks the rendering viewport regardless of
+        Playwright's no_viewport setting. Stripping these keys lets the browser
+        use the actual window dimensions for rendering.
+        """
+        env = opts.get("env", {})
+        # Reassemble the config JSON from CAMOU_CONFIG_* chunks
+        chunks = []
+        idx = 1
+        while f"CAMOU_CONFIG_{idx}" in env:
+            chunks.append(env[f"CAMOU_CONFIG_{idx}"])
+            idx += 1
+        if not chunks:
+            return
+        config = json.loads("".join(chunks))
+        # Remove viewport-locking properties
+        for key in (
+            "window.innerWidth",
+            "window.innerHeight",
+            "window.outerWidth",
+            "window.outerHeight",
+        ):
+            config.pop(key, None)
+        # Re-serialize and re-chunk
+        new_json = json.dumps(config)
+        chunk_size = 32767  # macOS/Linux
+        # Clear old chunks
+        for j in range(1, idx):
+            del env[f"CAMOU_CONFIG_{j}"]
+        # Write new chunks
+        for j, start in enumerate(range(0, len(new_json), chunk_size), 1):
+            env[f"CAMOU_CONFIG_{j}"] = new_json[start : start + chunk_size]
+
     async def ensure_browser(self) -> None:
         """Lazily launch the browser on first use."""
         if self._context is not None:
@@ -134,13 +171,29 @@ class BrowserManager:
         if self.locale:
             kwargs["locale"] = self.locale
 
-        # AsyncNewBrowser returns a Browser instance
-        self._browser = await AsyncNewBrowser(self._playwright, **kwargs)
+        if not self.headless:
+            # In headed mode, generate launch options and strip viewport-locking
+            # properties so the browser viewport follows the actual window size.
+            from camoufox.utils import launch_options as cf_launch_options
+            from functools import partial
+
+            opts = await asyncio.get_event_loop().run_in_executor(
+                None, partial(cf_launch_options, **kwargs)
+            )
+            self._strip_viewport_from_launch_opts(opts)
+            self._browser = await AsyncNewBrowser(
+                self._playwright, from_options=opts
+            )
+        else:
+            self._browser = await AsyncNewBrowser(self._playwright, **kwargs)
+
         # Build context kwargs — NOTE: record_video_dir is Chromium-only,
         # so we use screenshot-based recording via _start_recording() instead.
-        context_kwargs = {
-            "viewport": {"width": self.viewport_width, "height": self.viewport_height}
-        }
+        context_kwargs: Dict[str, Any] = {}
+        if self.headless:
+            context_kwargs["viewport"] = {"width": self.viewport_width, "height": self.viewport_height}
+        else:
+            context_kwargs["no_viewport"] = True
 
         self._context = await self._browser.new_context(**context_kwargs)
 
@@ -214,9 +267,10 @@ class BrowserManager:
     async def new_tab(self, url: Optional[str] = None) -> int:
         await self.ensure_browser()
         page = await self._context.new_page()
-        await page.set_viewport_size(
-            {"width": self.viewport_width, "height": self.viewport_height}
-        )
+        if self.headless:
+            await page.set_viewport_size(
+                {"width": self.viewport_width, "height": self.viewport_height}
+            )
         tab = TabInfo(page=page)
         self._setup_page_listeners(tab)
         self._tabs.append(tab)
